@@ -1,0 +1,28 @@
+name: Release to NPM and GitHub
+
+# Thin caller for the shared org workflow. Everything lives in
+# Nano-Collective/.github — change it there and every repo picks it up.
+#
+# Publishes only when package.json's version is ahead of npm, so merging the
+# Version Packages PR is what triggers a release. Nothing else does.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+  # Required for npm publish --provenance (OIDC build attestation).
+  id-token: write
+
+jobs:
+  release:
+    uses: Nano-Collective/.github/.github/workflows/release.yml@main
+    with:
+      release-name: 'Sentinel'
+      # Both are shipped: the CLI the bin maps to, and the library entry.
+      verify-files: 'dist/cli.js dist/index.js'
+      install-command: 'npx {pkg}@{version} init'
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

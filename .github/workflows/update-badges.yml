@@ -1,0 +1,31 @@
+name: Update Status Badges
+
+# Thin caller for the shared org workflow. Everything lives in
+# Nano-Collective/.github — change it there and every repo picks it up on its
+# next run.
+#
+# PAT_TOKEN is how the push gets past the branch rulesets. It is optional in the
+# shared workflow, but without it the push is made as github-actions[bot], which
+# the rulesets will refuse: adding the built-in Actions integration as a bypass
+# actor is rejected by GitHub with "Actor GitHub Actions integration must be
+# part of the ruleset source or owner organization" (tested 2026-09-07). So for
+# now every repo needs the secret.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *' # daily at midnight UTC
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  badges:
+    uses: Nano-Collective/.github/.github/workflows/update-badges.yml@main
+    with:
+      # This repo built before running tests, and its coverage run depends on it.
+      build-before-tests: true
+    secrets:
+      PAT_TOKEN: ${{ secrets.PAT_TOKEN }}

@@ -1,0 +1,165 @@
+/**
+ * Build a durable {@link RunRecord} from a run's {@link RunReport}. Pure — the
+ * CLI stamps the timestamp and mode and writes the JSON.
+ */
+
+import {SEVERITIES, type Severity} from '../findings/types.js';
+import {explainFullReason} from '../incremental/decide.js';
+import type {RunReport} from '../run/run.js';
+import type {RepoOutcome} from '../run/types.js';
+import type {
+	FilingSummary,
+	RepoRunRecord,
+	RunMode,
+	RunRecord,
+	RunUsage,
+	SeverityCounts,
+} from './types.js';
+import {RUN_RECORD_SCHEMA_VERSION} from './types.js';
+
+function emptyCounts(): SeverityCounts {
+	return {low: 0, medium: 0, high: 0, critical: 0};
+}
+
+function addCounts(into: SeverityCounts, from: SeverityCounts): void {
+	for (const severity of SEVERITIES) {
+		into[severity] += from[severity];
+	}
+}
+
+function repoRecord(outcome: RepoOutcome): RepoRunRecord {
+	const bySeverity = emptyCounts();
+	let findings = 0;
+	const packs = outcome.packs.map(pack => {
+		for (const finding of pack.findings) {
+			bySeverity[finding.severity as Severity] += 1;
+		}
+		findings += pack.findings.length;
+		return {
+			pack: pack.pack,
+			version: pack.version,
+			findings: pack.findings.length,
+			ok: pack.ok,
+		};
+	});
+	const record: RepoRunRecord = {
+		repo: outcome.repo,
+		findings,
+		bySeverity,
+		packs,
+	};
+	if (outcome.fullPasses && outcome.fullPasses.length > 0) {
+		record.fullPasses = outcome.fullPasses.map(
+			note => `${note.pack} — ${explainFullReason(note.reason)}`,
+		);
+	}
+	return record;
+}
+
+/** Build a run record from a report, a timestamp, and the run mode. */
+export function buildRunRecord(
+	report: RunReport,
+	timestamp: string,
+	mode: RunMode,
+): RunRecord {
+	const repos = report.outcome.repos.map(repoRecord);
+
+	const totalsBySeverity = emptyCounts();
+	let totalFindings = 0;
+	for (const repo of repos) {
+		addCounts(totalsBySeverity, repo.bySeverity);
+		totalFindings += repo.findings;
+	}
+
+	const usage: RunUsage = {
+		requests: 0,
+		durationMs: 0,
+		promptTokens: 0,
+		outputTokens: 0,
+	};
+	for (const repo of report.outcome.repos) {
+		for (const pack of repo.packs) {
+			usage.requests += pack.attempts;
+			usage.durationMs += pack.usage.durationMs;
+			usage.promptTokens += pack.usage.promptTokens;
+			usage.outputTokens += pack.usage.outputTokens;
+		}
+	}
+
+	const record: RunRecord = {
+		schemaVersion: RUN_RECORD_SCHEMA_VERSION,
+		timestamp,
+		mode,
+		repos,
+		totals: {
+			repos: repos.length,
+			findings: totalFindings,
+			bySeverity: totalsBySeverity,
+			usage,
+		},
+		targetErrors: report.targetErrors,
+	};
+
+	if (report.packLoadErrors.length > 0) {
+		record.packLoadErrors = report.packLoadErrors.map(({file, errors}) => {
+			const detail =
+				errors.length > 0
+					? errors.map(error => `${error.field}: ${error.message}`).join('; ')
+					: 'could not be parsed';
+			return `${file} — ${detail}`;
+		});
+	}
+
+	if (report.filed) {
+		const filing: FilingSummary = {
+			filed: 0,
+			touched: 0,
+			incremented: 0,
+			suppressed: 0,
+			suppressedByOverride: 0,
+			resolved: 0,
+		};
+		let held = 0;
+		for (const {result} of report.reconciled) {
+			filing.filed += result.created.length;
+			filing.touched += result.touched;
+			filing.incremented += result.incremented;
+			filing.suppressed += result.suppressed;
+			filing.suppressedByOverride += result.suppressedByOverride;
+			filing.resolved += result.resolved;
+			held += result.held;
+		}
+		// Only recorded when something was actually held. A run that read every
+		// file writes no `held` key, so the field means "this run skipped files
+		// and here is what that cost" rather than a zero on every record.
+		if (held > 0) {
+			filing.held = held;
+		}
+		record.filing = filing;
+	}
+
+	return record;
+}
+
+/** A filesystem-safe filename for a run record from its timestamp. */
+export function recordFilename(timestamp: string): string {
+	return `${timestamp.replace(/[:.]/g, '-')}.json`;
+}
+
+/**
+ * Whether this build can read a committed record.
+ *
+ * Records outlive the version that wrote them in both directions: an older
+ * Sentinel can meet a record a newer one committed, on any config repo where
+ * the workflow pins a version while a colleague ran a newer CLI locally. A
+ * record from a future schema is skipped rather than parsed hopefully — the
+ * same call the incremental cache makes, and for the same reason. Rendering a
+ * shape you do not understand produces a dashboard that is wrong without
+ * looking wrong.
+ *
+ * Absent means version 0, the shape written before this field existed. Those
+ * are readable: every difference from version 1 is an added optional field.
+ */
+export function isReadableRecord(record: RunRecord): boolean {
+	return (record.schemaVersion ?? 0) <= RUN_RECORD_SCHEMA_VERSION;
+}

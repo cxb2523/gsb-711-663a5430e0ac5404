@@ -1,0 +1,109 @@
+---
+title: "Findings & Issues"
+description: "The findings data model, the severity and confidence scale, issue filing, content-hash dedup, and the three-layer suppression model"
+sidebar_order: 6
+---
+
+# Findings & Issues
+
+A finding is one thing a rule pack flagged. When a finding meets your [severity threshold](../configuration/index.md#severity_threshold), Sentinel files it as an issue on the affected repository. This page covers the shape of a finding, how issues are filed and deduplicated, and the honest reality that an LLM-driven audit produces false positives — and what Sentinel does about it.
+
+## The findings data model
+
+Every finding carries a structured set of fields. These are a **stable contract**: rich enough that a future auto-fix surface could consume them without a migration, even though v1 does not open PRs.
+
+| Field | Description |
+| --- | --- |
+| `rule` | The rule pack (and pattern within it) that produced the finding. |
+| `file` | The affected file. |
+| `line_range` | The line range within that file. |
+| `category` | The finding's category (`security`, `correctness`, `performance`, `convention`, …), carried from the pack. |
+| `severity` | One of `low`, `medium`, `high`, `critical`. See below. |
+| `confidence` | The model's confidence in the finding, distinct from severity. |
+| `offending_snippet` | The relevant code excerpt. |
+
+The issue body adds a human-facing layer on top: a short summary, the rationale for the severity, and suggested next steps — the kind of note a reviewer leaves at the bottom of a code-review comment. Not patches; next steps.
+
+## Severity
+
+Sentinel uses a deliberate four-tier scale, with `confidence` and `category` as separate values. The fourth tier above `high` exists because for security work the cost of confusing "a notable pattern" with "a missing signer check or a leaked production credential" is asymmetric.
+
+| Severity | Meaning |
+| --- | --- |
+| `critical` | Exploitable or catastrophic. A missing signer check on a fund-moving path, a leaked live credential. Act now. |
+| `high` | Serious and likely real. Warrants prompt review. |
+| `medium` | Worth fixing; not urgent. The typical default filing floor. |
+| `low` | Minor or stylistic. Usually surfaced in the summary rather than filed. |
+
+There is no CVSS-style numeric scoring — that is overkill for an LLM-driven tool. `confidence` is what a maintainer reads alongside severity: a `high`/low-confidence finding reads very differently from a `high`/high-confidence one, and a good [rule pack](../rule-packs/authoring.md#writing-for-confidence) tells the model when to lower its confidence rather than guess.
+
+## Issue filing
+
+When a finding meets the threshold, the issue body includes:
+
+- A short summary of the finding.
+- The affected file(s), with line ranges.
+- The rule pack that produced it, linked to the pack.
+- The severity, and the rationale for that severity.
+- Suggested next steps.
+- A footer naming Sentinel as the source, linking the config repo, and explaining how to dismiss the finding if it is a false positive.
+
+Every issue is labelled with your configured [label](../configuration/index.md#issues) (default `sentinel`). By default issues file on the audited repo; set `aggregate_to_config_repo: true` to route them all to the config repo instead.
+
+## Dedup
+
+Sentinel must never file the same issue twice. Dedup is enforced by a **content hash**, and the test a field has to pass to be in it is not "does this describe the finding well" but **"will this be identical on the next run"**. Two fields pass:
+
+- the **rule pack** that produced the finding, as Sentinel recorded it;
+- the **file**.
+
+Everything else is excluded, and the reason is the same for all of it: a model does not repeat itself exactly.
+
+- The **line range** wobbles — lines 4–6 one day, 5–5 the next.
+- The **rule** is worse. The prompt asks the model to name the pattern that fired (`<pack>/<pattern>`), and it invents that suffix per run: three audits of one unchanged file produced `sql/string-concat`, `sql/string-concatenation` and `sql/string-concat-user-input`.
+- The **category** is model-authored too, and drifts the same way.
+
+The pack is the anchor precisely because it is **not** model-authored. It is stamped after validation from the pack that actually ran — not read back out of the rule prefix, which is only the model's transcription of it.
+
+All of these still appear in the issue body; they are simply not the finding's identity. The trade-off is that two distinct findings from one pack in one file collapse into a single issue, which is the cleaner outcome for a maintainer than several near-identical ones — and a far better failure than the alternative, which is a duplicate filed every morning while the original is aged towards being closed as fixed.
+
+A later run that produces the same finding **updates the existing issue's last-seen timestamp** instead of opening a duplicate. A finding that stops appearing across N consecutive runs is marked resolved automatically.
+
+### Auto-resolution only counts runs that looked
+
+"The finding is gone" and "the file was not read" arrive at the planner looking identical — in both cases the finding is simply absent. They mean opposite things, and treating the second as the first is how an audit tool ends up reporting a vulnerability as fixed because it stopped looking.
+
+So Sentinel records what each run actually read, and an open issue whose file was not read this run is **held**: neither refreshed nor aged, its miss counter left exactly where it was. Holding is recoverable — the issue stays open until a run reads the file again — where auto-closing is not.
+
+The scope is tracked **per rule pack**, because packs do not read the same files. If one pack skipped `src/db.ts` while another read it, an issue the first pack filed against that file was not re-examined, even though something looked at it.
+
+Held issues are counted separately from aged ones in the run summary, the run record and the dashboard. `aged` means Sentinel looked and did not find; `held` means it did not look. Collapsing them would hide the distinction this exists to draw.
+
+`held` is zero unless a target has [incremental scanning](../configuration/index.md#incremental) enabled — without it every run reads every file, so nothing is ever skipped and nothing needs holding. This is what makes skipping files safe rather than quietly destructive.
+
+Issues filed before Sentinel recorded this carry no file marker. They keep exactly their old behaviour while runs read everything, and they are marked the next time their finding recurs — which happens before any file is skipped, because the first run in a repository always reads everything.
+
+## Suppression
+
+False positives are inherent to any LLM-driven audit. Sentinel does not try to eliminate them before release — it makes them cheap to dismiss, the same way a reviewer marks a comment resolved. There are three layers, in increasing specificity:
+
+1. **Content-hash dedup (the floor).** Automatic. The same finding is never filed twice; see above.
+2. **Per-finding labels.** A maintainer closes or labels an individual issue:
+   - `sentinel:false-positive` — the finding is wrong. Sentinel reads the close and **never refiles it**.
+   - `sentinel:accepted` — acknowledged and accepted as-is.
+   - `sentinel:wontfix` — real, but not being fixed.
+3. **Per-repo `sentinel.yaml`.** For systematic noise on one repository, an opt-in [`sentinel.yaml` in the audited repo](../configuration/index.md#per-repository-overrides-sentinelyaml-in-an-audited-repo) is the escape hatch — repo-specific exemptions that do not belong in a shared pack.
+
+Reach for the least specific layer that solves the problem. A one-off wrong finding is a label; a whole category of noise on one repo is a config entry; a pattern that is wrong everywhere is a fix to the [rule pack's "do not flag" section](../rule-packs/authoring.md#4-what-not-to-flag--the-suppression-section).
+
+Every layer is counted in the per-repo run summary, so you can see which one is doing the work:
+
+```
+myorg/myrepo: filed 3, touched 5, aged 2, held 0, suppressed 1, suppressed-by-override 0, resolved 0
+```
+
+`touched` is layer 1 — an existing issue matched instead of a duplicate being filed. `suppressed` is layer 2, findings silenced by an issue carrying one of the `sentinel:false-positive` / `sentinel:wontfix` / `sentinel:accepted` labels. The label is what counts, not the close — an issue left open with a suppression label on it suppresses too, so a `wontfix` you never closed still shows up here. `suppressed-by-override` is layer 3, findings the audited repo's own `sentinel.yaml` removed. `aged` is the number of open issues that moved one run closer to auto-resolution, and `held` the number left untouched because this run did not read their file. Counters print even when zero — a zero is the signal that a layer is not firing, though read it alongside the errors printed underneath: an issue update that failed is reported as an error and is not counted here, so a run with errors can under-report. The same numbers are written to the [run record](../workflow/index.md#observability-and-run-history) and shown in the dashboard, so a scheduled run stays triageable after the fact.
+
+## Honest about false positives
+
+This is a first-class principle, not a disclaimer. A tool that pretends its findings are all real trains its users to either click through everything or stop reading. Sentinel's answer is: surface confidence honestly, dedup so nothing is filed twice, respect a `false-positive` close permanently, and keep the suppression path lighter than the finding is worth. The signal quality still depends on your rule packs and your model — but the flow around the findings is built to keep a maintainer trusting them.

@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env
+.env.local
+.DS_Store
+
+# Local calibration throwaways (root only — must not hide template/agents.config.json)
+/demo-pack.md
+/findings.md
+/agents.config.json
+
+# Nanocoder run artifacts
+.nanocoder/
+nanocoder-preferences.json

@@ -1,0 +1,213 @@
+/**
+ * The dedup executor. Fetches existing Sentinel issues on the target repo,
+ * plans the reconciliation, then applies it: file new findings, touch matched
+ * issues (reset misses + last-seen), age out absent ones, and auto-resolve the
+ * stale. Below-threshold findings are filtered out before planning, so they
+ * neither create nor touch.
+ */
+
+import type {RepoOverride, SentinelConfig} from '../config/types.js';
+import {type Finding, meetsSeverityThreshold} from '../findings/types.js';
+import {
+	buildIssueContent,
+	targetRepoFor,
+	withScopeMarkers,
+} from '../issues/file.js';
+import type {
+	CreatedIssue,
+	FilingContext,
+	ReconcileClient,
+} from '../issues/types.js';
+import {applyRepoOverride} from '../suppression/apply.js';
+import {upsertMarker} from './markers.js';
+import {
+	planReconciliation,
+	type ReconcileOptions,
+	SUPPRESSION_LABELS,
+} from './plan.js';
+
+/**
+ * Options for the executor. Extends the planner's with the one thing only the
+ * executor needs: which pack produced each finding, so the issues it files
+ * carry the marker a later partial run reads back.
+ */
+export interface ReconcileExecOptions extends ReconcileOptions {
+	/**
+	 * The pack each finding came from, keyed by the finding object itself.
+	 *
+	 * Identity, not value: the findings handed to this function are the same
+	 * objects the run collected from each pack outcome (the override and
+	 * threshold steps filter, they do not copy). A finding missing from the map
+	 * simply files without a `pack` marker, which is the safe direction — an
+	 * unattributable issue is held on a partial run rather than aged out.
+	 */
+	packOfFinding?: ReadonlyMap<Finding, string>;
+}
+
+/** A summary of what one reconcile run did. */
+export interface ReconcileResult {
+	targetRepo: string;
+	created: CreatedIssue[];
+	touched: number;
+	incremented: number;
+	resolved: number;
+	/**
+	 * Open issues left alone because this run did not read their file. Counted
+	 * separately from `incremented` on purpose: an aged issue is one Sentinel
+	 * looked for and did not find, a held issue is one it never looked for, and
+	 * collapsing them would hide exactly the distinction this exists to make.
+	 */
+	held: number;
+	/** Findings suppressed by a label-closed issue (dedup layer). */
+	suppressed: number;
+	/** Findings removed by the per-repo override's suppress rules. */
+	suppressedByOverride: number;
+	/** Per-operation failures that were tolerated (create/update/close). */
+	errors: string[];
+}
+
+function trackedBody(body: string, now: string): string {
+	return upsertMarker(upsertMarker(body, 'last-seen', now), 'misses', '0');
+}
+
+/** Run a mutation, recording (not throwing) its failure so the run continues. */
+async function tolerate(
+	errors: string[],
+	label: string,
+	op: () => Promise<void>,
+): Promise<void> {
+	try {
+		await op();
+	} catch (error) {
+		errors.push(
+			`${label}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
+/**
+ * Reconcile this run's findings against the issues already on the target repo.
+ * `now` is passed in (ISO string) so the executor stays deterministic.
+ */
+export async function reconcileFindings(
+	findings: Finding[],
+	config: SentinelConfig,
+	client: ReconcileClient,
+	context: FilingContext,
+	now: string,
+	options: ReconcileExecOptions = {},
+	override?: RepoOverride,
+): Promise<ReconcileResult> {
+	const targetRepo = targetRepoFor(config, context);
+	const existing = await client.listIssues({
+		repo: targetRepo,
+		label: config.issues.label,
+	});
+
+	// Layer 3: apply the per-repo override (threshold + suppress rules), then
+	// gate by the effective threshold before planning.
+	const {
+		kept,
+		suppressed: overrideSuppressed,
+		threshold,
+	} = applyRepoOverride(findings, config, override);
+	const qualifying = kept.filter(finding =>
+		meetsSeverityThreshold(finding.severity, threshold),
+	);
+	const plan = planReconciliation(qualifying, existing, options);
+	const errors: string[] = [];
+
+	// Sentinel's own labels must exist before filing or GitHub rejects them.
+	// Failures here are tolerated but not swallowed: each one means issues below
+	// may file without that label, which quietly breaks dedup and suppression.
+	if (plan.toCreate.length > 0) {
+		await tolerate(errors, 'ensure labels', async () => {
+			const failures = await client.ensureLabels({
+				repo: targetRepo,
+				labels: [config.issues.label, ...SUPPRESSION_LABELS],
+			});
+			for (const failure of failures) {
+				errors.push(`ensure label "${failure.label}": ${failure.error}`);
+			}
+		});
+	}
+
+	const created: CreatedIssue[] = [];
+	for (const finding of plan.toCreate) {
+		const content = buildIssueContent(finding, config, {
+			...context,
+			pack: options.packOfFinding?.get(finding) ?? context.pack,
+		});
+		try {
+			created.push(
+				await client.createIssue({
+					repo: targetRepo,
+					...content,
+					body: trackedBody(content.body, now),
+				}),
+			);
+		} catch (error) {
+			errors.push(
+				`create (${finding.file}): ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	let touched = 0;
+	for (const {issue, finding} of plan.toTouch) {
+		await tolerate(errors, `touch #${issue.number}`, async () => {
+			// Backfill the scope markers while we are already rewriting the body.
+			// This is what migrates issues filed before the markers existed: the
+			// first run after an upgrade reads every file, so every issue whose
+			// finding still recurs is touched here and is marked before any later
+			// run is in a position to skip anything.
+			await client.updateIssue({
+				repo: targetRepo,
+				number: issue.number,
+				body: withScopeMarkers(trackedBody(issue.body, now), finding, {
+					...context,
+					pack: options.packOfFinding?.get(finding) ?? context.pack,
+				}),
+			});
+			touched++;
+		});
+	}
+
+	let incremented = 0;
+	for (const {issue, misses} of plan.toIncrementMiss) {
+		await tolerate(errors, `age #${issue.number}`, async () => {
+			await client.updateIssue({
+				repo: targetRepo,
+				number: issue.number,
+				body: upsertMarker(issue.body, 'misses', String(misses)),
+			});
+			incremented++;
+		});
+	}
+
+	let resolved = 0;
+	for (const issue of plan.toResolve) {
+		await tolerate(errors, `resolve #${issue.number}`, async () => {
+			await client.closeIssue({
+				repo: targetRepo,
+				number: issue.number,
+				reason: 'completed',
+				comment:
+					'Sentinel is auto-resolving this finding: it has not recurred across recent audit runs.',
+			});
+			resolved++;
+		});
+	}
+
+	return {
+		targetRepo,
+		created,
+		touched,
+		incremented,
+		resolved,
+		held: plan.held.length,
+		suppressed: plan.suppressed.length,
+		suppressedByOverride: overrideSuppressed.length,
+		errors,
+	};
+}
