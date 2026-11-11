@@ -95,6 +95,46 @@ test('a fully-qualified key wins over a bare one', t => {
 	t.is(result.findings[0]?.severity, 'critical');
 });
 
+test('a fully-qualified win is what the override record reports', t => {
+	// The override log is how the run explains itself; when both spellings are
+	// present it must name the fully-qualified weight, not the bare one.
+	const result = applySeverityWeighting(
+		[finding({severity: 'low'})],
+		pack({
+			'sql-injection': 'medium',
+			'db-safety/sql-injection': 'critical',
+		}),
+	);
+	t.deepEqual(result.overrides, [
+		{
+			rule: 'db-safety/sql-injection',
+			file: 'src/db.ts',
+			from: 'low',
+			to: 'critical',
+		},
+	]);
+});
+
+test('a rule named like an Object.prototype member is not weighted', t => {
+	// Regression: the weighting table was read with `in`-style lookups, so a
+	// finding whose bare rule name is `toString` (or `constructor`, …) matched
+	// an inherited property and had its severity "overridden" to a function.
+	// Such a rule is not in the table; its severity must pass through intact.
+	const result = applySeverityWeighting(
+		[
+			finding({rule: 'db-safety/toString', severity: 'high'}),
+			finding({rule: 'db-safety/constructor', severity: 'medium'}),
+			finding({rule: 'hasOwnProperty', severity: 'low'}),
+		],
+		pack({'sql-injection': 'critical'}),
+	);
+	t.deepEqual(
+		result.findings.map(f => f.severity),
+		['high', 'medium', 'low'],
+	);
+	t.deepEqual(result.overrides, []);
+});
+
 test('an unweighted rule keeps the severity the model chose', t => {
 	const result = applySeverityWeighting(
 		[finding({rule: 'db-safety/unbounded-query', severity: 'high'})],

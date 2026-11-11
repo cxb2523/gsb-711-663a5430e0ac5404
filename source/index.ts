@@ -20,8 +20,16 @@ export type {
 	Target,
 } from './config/types.js';
 export {findingHash} from './dedup/hash.js';
+export {
+	type DiagnoseOptions,
+	diagnoseIssueIdentities,
+	type IssueDiagnosis,
+	type IssueIdentityStatus,
+} from './dedup/diagnose.js';
 export {readMarker, readMisses, upsertMarker} from './dedup/markers.js';
 export {
+	hasSuppressionLabel,
+	identityKeysOf,
 	planReconciliation,
 	type ReconcileOptions,
 	type ReconcilePlan,

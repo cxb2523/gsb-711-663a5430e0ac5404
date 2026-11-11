@@ -44,14 +44,22 @@ function weightFor(
 	rule: string,
 	weighting: Record<string, Severity>,
 ): Severity | undefined {
-	if (weighting[rule]) {
+	// Own-property lookups, not prototype-chain ones: a rule whose bare name
+	// happens to be an Object.prototype member (`toString`, `constructor`, …)
+	// is not in the weighting table, and must keep the severity the model
+	// chose rather than being "overridden" to an inherited function.
+	if (Object.hasOwn(weighting, rule)) {
 		return weighting[rule];
 	}
 	const slash = rule.lastIndexOf('/');
 	if (slash === -1) {
 		return undefined;
 	}
-	return weighting[rule.slice(slash + 1)];
+	const bare = rule.slice(slash + 1);
+	if (Object.hasOwn(weighting, bare)) {
+		return weighting[bare];
+	}
+	return undefined;
 }
 
 /**

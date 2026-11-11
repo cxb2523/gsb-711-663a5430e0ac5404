@@ -66,7 +66,7 @@ export interface ReconcilePlan {
 	held: ExistingIssue[];
 }
 
-function hasSuppressionLabel(issue: ExistingIssue): boolean {
+export function hasSuppressionLabel(issue: ExistingIssue): boolean {
 	return issue.labels.some(label =>
 		(SUPPRESSION_LABELS as readonly string[]).includes(label),
 	);
@@ -78,7 +78,7 @@ function hasSuppressionLabel(issue: ExistingIssue): boolean {
  * filed by this version produces the same value twice; one filed by an older
  * version produces two different ones, and matching on either is correct.
  */
-function identityKeysOf(issue: ExistingIssue): string[] {
+export function identityKeysOf(issue: ExistingIssue): string[] {
 	const keys = new Set<string>();
 	const stored = readMarker(issue.body, 'hash');
 	if (stored !== null) {
